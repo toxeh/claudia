@@ -156,14 +156,16 @@ class AnthropicUsageWidget(private val project: Project) : CustomStatusBarWidget
             "$label: $percentage%"
         }
 
-        // Color based on usage percentage.
-        val color = when {
-            percentage >= 90 -> JBColor(Color(200, 50, 50), Color(180, 40, 40))      // Red.
-            percentage >= 75 -> JBColor(Color(255, 165, 0), Color(200, 130, 0))      // Orange.
-            else -> JBColor(Color(50, 150, 50), Color(80, 170, 80))                  // Green.
-        }
+        // Calculate time progress for the line.
+        val isFiveHour = settings.displayMode == AnthropicSettingsState.UsageDisplayMode.FIVE_HOUR
+        val timeProgress = data.calculateTimeProgress(java.time.Instant.now(), isFiveHour)
 
-        panel.updateUsage(percentage, text, color)
+        // Color based on usage percentage and time progress.
+        // Use raw utilization for precise color threshold evaluation.
+        val utilization = if (isFiveHour) data.fiveHourUtilization else data.sevenDayUtilization
+        val color = UsageColorLogic.getColor(utilization, timeProgress, settings.timeBasedColoring)
+
+        panel.updateUsage(percentage, text, color, timeProgress)
         panel.toolTipText = buildTooltip(data)
         panel.isVisible = true
     }
@@ -178,31 +180,82 @@ class AnthropicUsageWidget(private val project: Project) : CustomStatusBarWidget
         val isDark = UIUtil.isUnderDarcula()
         val barBg = if (isDark) "#555555" else "#cccccc"
 
-        fun barColor(pct: Double): String = when {
-            pct >= 90 -> if (isDark) "#b42828" else "#c83232"
-            pct >= 75 -> if (isDark) "#c88200" else "#ffa500"
-            else -> if (isDark) "#50aa50" else "#329632"
+        fun colorToHex(c: java.awt.Color): String = String.format("#%02x%02x%02x", c.red, c.green, c.blue)
+
+        fun barColor(pct: Double, timeProgress: Double = 0.0): String {
+            if (settings.timeBasedColoring) {
+                val awtColor = UsageColorLogic.getColor(pct, timeProgress, true)
+                return colorToHex(awtColor)
+            }
+            return when {
+                pct >= 90 -> if (isDark) "#b42828" else "#c83232"
+                pct >= 75 -> if (isDark) "#c88200" else "#ffa500"
+                else -> if (isDark) "#50aa50" else "#329632"
+            }
         }
 
-        fun progressBar(pct: Double, suffix: String? = null): String {
+        fun progressBar(pct: Double, suffix: String? = null, timeProgress: Double = 0.0): String {
             val clamped = pct.coerceIn(0.0, 100.0)
             val filled = clamped.toInt()
-            val remaining = 100 - filled
-            val color = barColor(clamped)
+            val color = barColor(clamped, timeProgress)
             val pctLabel = String.format("%.1f%%", clamped) + (suffix?.let { " &middot; $it" } ?: "")
             val filledTextColor = if (isDark) "#eeeeee" else "#ffffff"
             val bgTextColor = if (isDark) "#dddddd" else "#333333"
-            val cells = if (filled >= 50) {
-                """<td width="$filled%" bgcolor="$color" height="16" align="center"><font size="2" color="$filledTextColor">$pctLabel</font></td>
-                   <td width="$remaining%" bgcolor="$barBg" height="16"></td>"""
+
+            val showMarker = settings.timeBasedColoring && timeProgress > 0
+            val markerPos = if (showMarker) timeProgress.coerceIn(1.0, 99.0).toInt() else -1
+            val lineColor = if (isDark) "#b450ff" else "#800080"
+
+            val cells = if (!showMarker) {
+                // No marker — original 2-cell layout.
+                if (filled >= 50) {
+                    """<td width="$filled%" bgcolor="$color" height="16" align="center"><font size="2" color="$filledTextColor">$pctLabel</font></td>
+                       <td width="${100 - filled}%" bgcolor="$barBg" height="16"></td>"""
+                } else {
+                    """<td width="$filled%" bgcolor="$color" height="16"></td>
+                       <td width="${100 - filled}%" bgcolor="$barBg" height="16" align="center"><font size="2" color="$bgTextColor">$pctLabel</font></td>"""
+                }
+            } else if (markerPos <= filled) {
+                // Marker inside the filled area — split filled into before/after.
+                val before = (markerPos).coerceAtLeast(0)
+                val after = (filled - markerPos - 1).coerceAtLeast(0)
+                val remaining = (100 - filled).coerceAtLeast(0)
+                if (filled >= 50) {
+                    """<td width="$before%" bgcolor="$color" height="16" align="center"><font size="2" color="$filledTextColor">$pctLabel</font></td>
+                       <td width="1%" bgcolor="$lineColor" height="16"></td>
+                       <td width="$after%" bgcolor="$color" height="16"></td>
+                       <td width="$remaining%" bgcolor="$barBg" height="16"></td>"""
+                } else {
+                    """<td width="$before%" bgcolor="$color" height="16"></td>
+                       <td width="1%" bgcolor="$lineColor" height="16"></td>
+                       <td width="$after%" bgcolor="$color" height="16"></td>
+                       <td width="$remaining%" bgcolor="$barBg" height="16" align="center"><font size="2" color="$bgTextColor">$pctLabel</font></td>"""
+                }
             } else {
-                """<td width="$filled%" bgcolor="$color" height="16"></td>
-                   <td width="$remaining%" bgcolor="$barBg" height="16" align="center"><font size="2" color="$bgTextColor">$pctLabel</font></td>"""
+                // Marker inside the remaining (background) area.
+                val bgBefore = (markerPos - filled).coerceAtLeast(0)
+                val bgAfter = (100 - markerPos - 1).coerceAtLeast(0)
+                if (filled >= 50) {
+                    """<td width="$filled%" bgcolor="$color" height="16" align="center"><font size="2" color="$filledTextColor">$pctLabel</font></td>
+                       <td width="$bgBefore%" bgcolor="$barBg" height="16"></td>
+                       <td width="1%" bgcolor="$lineColor" height="16"></td>
+                       <td width="$bgAfter%" bgcolor="$barBg" height="16"></td>"""
+                } else {
+                    """<td width="$filled%" bgcolor="$color" height="16"></td>
+                       <td width="$bgBefore%" bgcolor="$barBg" height="16" align="center"><font size="2" color="$bgTextColor">$pctLabel</font></td>
+                       <td width="1%" bgcolor="$lineColor" height="16"></td>
+                       <td width="$bgAfter%" bgcolor="$barBg" height="16"></td>"""
+                }
             }
+
             return """<table width="250" cellpadding="0" cellspacing="0" style="margin:2px 0">
                 <tr>$cells</tr>
             </table>"""
         }
+
+        val now = java.time.Instant.now()
+        val fiveHourTimeProgress = data.calculateTimeProgress(now, isFiveHour = true)
+        val sevenDayTimeProgress = data.calculateTimeProgress(now, isFiveHour = false)
 
         val sevenDayResetInfo = data.formattedSevenDayResetsAt?.let { "Resets $it" } ?: ""
 
@@ -228,10 +281,10 @@ class AnthropicUsageWidget(private val project: Project) : CustomStatusBarWidget
             <b>Claude Usage</b>
             <br/><br/>
             <b>5-Hour Limit</b>
-            ${progressBar(data.fiveHourUtilization, data.fiveHourTimeRemaining)}
+            ${progressBar(data.fiveHourUtilization, data.fiveHourTimeRemaining, fiveHourTimeProgress)}
             <br/>
             <b>7-Day Limit</b>
-            ${progressBar(data.sevenDayUtilization)}
+            ${progressBar(data.sevenDayUtilization, timeProgress = sevenDayTimeProgress)}
             ${if (sevenDayResetInfo.isNotEmpty()) "<span style='font-size:small'>$sevenDayResetInfo</span>" else ""}
             $breakdownHtml
             <br/>
@@ -254,8 +307,11 @@ class AnthropicUsageWidget(private val project: Project) : CustomStatusBarWidget
      */
     private class CustomProgressPanel : JPanel() {
         private var percentage: Int = 0
+        private var timeProgress: Double = 0.0
         private var text: String = "Loading..."
         private var barColor: Color = JBColor.GREEN
+
+        private val TIME_LINE_COLOR = JBColor(Color(128, 0, 128), Color(180, 80, 255)) // Purple
 
         init {
             preferredSize = Dimension(130, 20)
@@ -263,10 +319,11 @@ class AnthropicUsageWidget(private val project: Project) : CustomStatusBarWidget
             isOpaque = false
         }
 
-        fun updateUsage(percentage: Int, text: String, color: Color) {
+        fun updateUsage(percentage: Int, text: String, color: Color, timeProgress: Double = 0.0) {
             this.percentage = percentage
             this.text = text
             this.barColor = color
+            this.timeProgress = timeProgress
             repaint()
         }
 
@@ -297,6 +354,14 @@ class AnthropicUsageWidget(private val project: Project) : CustomStatusBarWidget
             // Draw border.
             g2.color = if (UIUtil.isUnderDarcula()) Gray._70 else Gray._180
             g2.drawRoundRect(x, y, width - 1, height - 1, 3, 3)
+
+            // Draw time progress line (purple).
+            if (timeProgress > 0) {
+                val lineX = x + (width * timeProgress / 100).toInt().coerceIn(0, width - 1)
+                g2.color = TIME_LINE_COLOR
+                g2.stroke = BasicStroke(1.5f)
+                g2.drawLine(lineX, y, lineX, y + height - 1)
+            }
 
             // Draw text centered.
             g2.color = if (UIUtil.isUnderDarcula()) Gray._220 else Gray._50
